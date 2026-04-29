@@ -889,6 +889,11 @@ func (d *common) isRunningStatusCode(statusCode api.StatusCode) bool {
 	return statusCode != api.Error && statusCode != api.Stopped
 }
 
+// isErrorStatusCode returns if instance is errored from status code.
+func (d *common) isErrorStatusCode(statusCode api.StatusCode) bool {
+	return statusCode == api.Error
+}
+
 // isStartableStatusCode returns an error if the status code means the instance cannot be started currently.
 func (d *common) isStartableStatusCode(statusCode api.StatusCode) error {
 	if d.isRunningStatusCode(statusCode) {
@@ -1075,10 +1080,6 @@ func (d *common) recordLastState() error {
 }
 
 func (d *common) setCoreSched(pids []int) error {
-	if !d.state.OS.CoreScheduling {
-		return nil
-	}
-
 	args := []string{
 		"forkcoresched",
 		"0",

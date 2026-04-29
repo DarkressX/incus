@@ -463,7 +463,7 @@ func (d *zfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcData 
 
 		if len(srcBackup.Snapshots) > 0 {
 			// Create new snapshots directory.
-			err := createParentSnapshotDirIfMissing(d.name, v.volType, v.name)
+			err := CreateParentSnapshotDirIfMissing(d.name, v.volType, v.name)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -686,26 +686,15 @@ func (d *zfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool
 
 		// Handle transferring snapshots.
 		if len(snapshots) > 0 {
-			args := []string{"send", "-R"}
-
-			// Use raw flag is supported, this is required to send/receive encrypted volumes (and enables compression).
-			if zfsRaw {
-				args = append(args, "-w")
-			}
-
-			args = append(args, srcSnapshot)
-
+			// Raw send is required to send/receive encrypted volumes (and enables compression).
+			args := []string{"send", "-R", "-w", srcSnapshot}
 			sender = exec.Command("zfs", args...)
 		} else {
 			args := []string{"send"}
 
 			// Check if nesting is required.
 			if d.needsRecursion(d.dataset(srcVol, false)) {
-				args = append(args, "-R")
-
-				if zfsRaw {
-					args = append(args, "-w")
-				}
+				args = append(args, "-R", "-w")
 			}
 
 			if d.config["zfs.clone_copy"] == "rebase" {
@@ -1100,7 +1089,7 @@ func (d *zfs) createVolumeFromMigrationOptimized(vol Volume, conn io.ReadWriteCl
 	// Handle zfs send/receive migration.
 	if len(volTargetArgs.Snapshots) > 0 {
 		// Create the parent directory.
-		err := createParentSnapshotDirIfMissing(d.name, vol.volType, vol.name)
+		err := CreateParentSnapshotDirIfMissing(d.name, vol.volType, vol.name)
 		if err != nil {
 			return err
 		}
@@ -1297,11 +1286,7 @@ func (d *zfs) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, al
 
 		// Check if nesting is required.
 		if d.needsRecursion(d.dataset(src, false)) {
-			args = append(args, "-R")
-
-			if zfsRaw {
-				args = append(args, "-w")
-			}
+			args = append(args, "-R", "-w")
 		}
 
 		if origin.Name() != src.Name() {
@@ -2970,11 +2955,7 @@ func (d *zfs) BackupVolume(vol Volume, writer instancewriter.InstanceWriter, bas
 
 		// Check if nesting is required.
 		if d.needsRecursion(path) {
-			args = append(args, "-R")
-
-			if zfsRaw {
-				args = append(args, "-w")
-			}
+			args = append(args, "-R", "-w")
 		}
 
 		if parent != "" {
@@ -3095,7 +3076,7 @@ func (d *zfs) CreateVolumeSnapshot(vol Volume, op *operations.Operation) error {
 	defer reverter.Fail()
 
 	// Create the parent directory.
-	err := createParentSnapshotDirIfMissing(d.name, vol.volType, parentName)
+	err := CreateParentSnapshotDirIfMissing(d.name, vol.volType, parentName)
 	if err != nil {
 		return err
 	}
@@ -3507,12 +3488,8 @@ func (d *zfs) VolumeSnapshots(vol Volume, op *operations.Operation) ([]string, e
 	return snapshots, nil
 }
 
-// RestoreVolume restores a volume from a snapshot.
-func (d *zfs) RestoreVolume(vol Volume, snapshotName string, op *operations.Operation) error {
-	return d.restoreVolume(vol, snapshotName, false, op)
-}
-
-func (d *zfs) restoreVolume(vol Volume, snapshotName string, migration bool, op *operations.Operation) error {
+// CanRestoreVolume restores a volume from a snapshot.
+func (d *zfs) CanRestoreVolume(vol Volume, snapshotName string) error {
 	// Get the list of snapshots.
 	entries, err := d.getDatasets(d.dataset(vol, false), "snapshot")
 	if err != nil {
@@ -3557,6 +3534,20 @@ func (d *zfs) restoreVolume(vol Volume, snapshotName string, migration bool, op 
 		return err
 	}
 
+	return nil
+}
+
+// RestoreVolume restores a volume from a snapshot.
+func (d *zfs) RestoreVolume(vol Volume, snapshotName string, op *operations.Operation) error {
+	return d.restoreVolume(vol, snapshotName, false, op)
+}
+
+func (d *zfs) restoreVolume(vol Volume, snapshotName string, isMigration bool, op *operations.Operation) error {
+	err := d.CanRestoreVolume(vol, snapshotName)
+	if err != nil {
+		return err
+	}
+
 	// Restore the snapshot.
 	datasets, err := d.getDatasets(d.dataset(vol, false), "snapshot")
 	if err != nil {
@@ -3595,9 +3586,9 @@ func (d *zfs) restoreVolume(vol Volume, snapshotName string, migration bool, op 
 	}
 
 	// For VM images, restore the associated filesystem dataset too.
-	if !migration && vol.IsVMBlock() {
+	if !isMigration && vol.IsVMBlock() {
 		fsVol := vol.NewVMBlockFilesystemVolume()
-		err := d.restoreVolume(fsVol, snapshotName, migration, op)
+		err := d.restoreVolume(fsVol, snapshotName, isMigration, op)
 		if err != nil {
 			return err
 		}

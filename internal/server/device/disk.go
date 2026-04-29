@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 
@@ -42,6 +43,8 @@ import (
 	"github.com/lxc/incus/v6/shared/util"
 	"github.com/lxc/incus/v6/shared/validate"
 )
+
+var diskISOGenerateMu sync.Mutex
 
 // Special disk "source" value used for generating a VM cloud-init config ISO.
 const diskSourceCloudInit = "cloud-init:config"
@@ -1966,8 +1969,8 @@ func (d *disk) generateLimits(runConf *deviceConfig.RunConfig) error {
 	}
 
 	if hasDiskLimits {
-		if !d.state.OS.CGInfo.Supports(cgroup.Blkio, nil) {
-			return errors.New("Cannot apply disk limits as blkio cgroup controller is missing")
+		if !cgroup.Supports(cgroup.IO) {
+			return errors.New("Cannot apply disk limits as IO cgroup controller is missing")
 		}
 
 		diskLimits, err := d.getDiskLimits()
@@ -2018,11 +2021,13 @@ type cgroupWriter struct {
 	runConf *deviceConfig.RunConfig
 }
 
-func (w *cgroupWriter) Get(version cgroup.Backend, controller string, key string) (string, error) {
+// Get is unimplemented for this cgroup handler.
+func (w *cgroupWriter) Get(controller string, key string) (string, error) {
 	return "", errors.New("This cgroup handler does not support reading")
 }
 
-func (w *cgroupWriter) Set(version cgroup.Backend, controller string, key string, value string) error {
+// Set queues a cgroup key/value to be applied as part of the run config.
+func (w *cgroupWriter) Set(controller string, key string, value string) error {
 	w.runConf.CGroups = append(w.runConf.CGroups, deviceConfig.RunConfigItem{
 		Key:   key,
 		Value: value,
@@ -2965,6 +2970,10 @@ func (d *disk) getParentBlocks(path string) ([]string, error) {
 // generateVMAgent generates an ISO containing the VM agent binary and config.
 // Returns the path to the ISO.
 func (d *disk) generateVMAgentDrive() (string, error) {
+	// Take a lock to avoid concurrent start/migrate filling up the disk.
+	diskISOGenerateMu.Lock()
+	defer diskISOGenerateMu.Unlock()
+
 	scratchDir := filepath.Join(d.inst.DevicesPath(), linux.PathNameEncode(d.name))
 	defer func() { _ = os.RemoveAll(scratchDir) }()
 
@@ -3044,6 +3053,10 @@ func (d *disk) generateVMAgentDrive() (string, error) {
 // generateVMConfigDrive generates an ISO containing the cloud init config for a VM.
 // Returns the path to the ISO.
 func (d *disk) generateVMConfigDrive() (string, error) {
+	// Take a lock to avoid concurrent start/migrate filling up the disk.
+	diskISOGenerateMu.Lock()
+	defer diskISOGenerateMu.Unlock()
+
 	scratchDir := filepath.Join(d.inst.DevicesPath(), linux.PathNameEncode(d.name))
 	defer func() { _ = os.RemoveAll(scratchDir) }()
 

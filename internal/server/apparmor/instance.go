@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/lxc/incus/v6/internal/server/cgroup"
 	"github.com/lxc/incus/v6/internal/server/instance/drivers/edk2"
 	"github.com/lxc/incus/v6/internal/server/instance/instancetype"
 	"github.com/lxc/incus/v6/internal/server/project"
@@ -182,12 +181,10 @@ func instanceProfile(sysOS *sys.OS, inst instance, extraBinaries []string) (stri
 	if inst.Type() == instancetype.Container {
 		err = lxcProfileTpl.Execute(sb, map[string]any{
 			"extra_binaries":   extraBinaries,
-			"feature_cgns":     sysOS.CGInfo.Namespacing,
-			"feature_cgroup2":  sysOS.CGInfo.Layout == cgroup.CgroupsUnified || sysOS.CGInfo.Layout == cgroup.CgroupsHybrid,
 			"feature_stacking": sysOS.AppArmorStacking && !sysOS.AppArmorStacked,
 			"feature_unix":     unixSupported,
 			"feature_userns":   usernsSupported,
-			"kernel_binfmt":    util.IsFalseOrEmpty(inst.ExpandedConfig()["security.privileged"]) && sysOS.UnprivBinfmt,
+			"kernel_binfmt":    util.IsFalseOrEmpty(inst.ExpandedConfig()["security.privileged"]),
 			"name":             InstanceProfileName(inst),
 			"namespace":        InstanceNamespaceName(inst),
 			"nesting":          util.IsTrue(inst.ExpandedConfig()["security.nesting"]),

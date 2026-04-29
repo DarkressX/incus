@@ -478,7 +478,7 @@ func (d *qemu) getMonitorEventHandler() func(event string, data map[string]any) 
 	state := d.state
 
 	return func(event string, data map[string]any) {
-		if !slices.Contains([]string{qmp.EventVMShutdown, qmp.EventVMReset, qmp.EventAgentStarted, qmp.EventAgentStopped, qmp.EventRTCChange}, event) {
+		if !slices.Contains([]string{qmp.EventVMShutdown, qmp.EventVMReset, qmp.EventAgentStarted, qmp.EventAgentStopped, qmp.EventRTCChange, qmp.EventBlockJobCompleted, qmp.EventBlockJobError}, event) {
 			return // Don't bother loading the instance from DB if we aren't going to handle the event.
 		}
 
@@ -566,6 +566,11 @@ func (d *qemu) getMonitorEventHandler() func(event string, data map[string]any) 
 			if err != nil {
 				d.logger.Error("Failed to apply rtc change", logger.Ctx{"offset": val, "err": err})
 			}
+
+		case qmp.EventBlockJobCompleted, qmp.EventBlockJobError:
+			monitor, _ := d.qmpConnect()
+			monitor.PushEvent(event, data)
+			monitor.CleanupEventChannel(data["device"].(string))
 		}
 	}
 }
@@ -1064,6 +1069,8 @@ func (d *qemu) restoreState(monitor *qmp.Monitor) error {
 					return
 				}
 
+				devicesMap := storagePools.DevicesMapFromBackupConfig(config)
+
 				for _, vol := range config.DependentVolumes {
 					diskPool, err := storagePools.LoadByName(d.state, vol.Pool.Name)
 					if err != nil {
@@ -1074,9 +1081,14 @@ func (d *qemu) restoreState(monitor *qmp.Monitor) error {
 						continue
 					}
 
-					d.logger.Debug("Receiving dependent volume", logger.Ctx{"name": vol.Volume.Name})
+					d.logger.Debug("Receiving dependent volume", logger.Ctx{"name": vol.Volume.Name, "pool": vol.Pool.Name})
+					deviceName := storagePools.DeviceByPoolAndVolume(devicesMap, vol.Pool.Name, vol.Volume.Name)
+					if deviceName == "" {
+						d.logger.Error("Failed to find requested device", logger.Ctx{"pool": vol.Pool.Name, "volName": vol.Volume.Name})
+						return
+					}
 
-					diskName := d.blockNodeName(linux.PathNameEncode(vol.Volume.Name))
+					diskName := d.blockNodeName(linux.PathNameEncode(deviceName))
 
 					err = d.receiveMigrationSnapshot(monitor, diskName, filesystemConn)
 					if err != nil {
@@ -1226,7 +1238,8 @@ func (d *qemu) validateStartup(stateful bool, statusCode api.StatusCode) error {
 	}
 
 	// Cannot perform stateful start unless config is appropriately set.
-	if stateful && !d.CanLiveMigrate() {
+	// NOTE: We can't use CanLiveMigrate during instance startup as the boot state hasn't yet been recorded.
+	if stateful && util.IsFalseOrEmpty(d.expandedConfig["migration.stateful"]) {
 		return errors.New("Stateful start requires migration.stateful to be set to true")
 	}
 
@@ -2042,7 +2055,8 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 	}
 
 	// Record the QEMU machine definition.
-	if !stateful && d.CanLiveMigrate() {
+	// NOTE: We can't use CanLiveMigrate during instance startup as the boot state hasn't yet been recorded.
+	if !stateful && util.IsTrue(d.expandedConfig["migration.stateful"]) {
 		definition, err := monitor.MachineDefinition()
 		if err != nil {
 			op.Done(err)
@@ -2372,7 +2386,10 @@ func (d *qemu) advertiseVsockAddress() error {
 		SkipGetServer: true,
 	}
 
-	agent, err := incus.ConnectIncusHTTP(agentArgs, client)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	agent, err := incus.ConnectIncusHTTPWithContext(ctx, agentArgs, client)
 	if err != nil {
 		return fmt.Errorf("Failed connecting to the agent: %w", err)
 	}
@@ -3935,7 +3952,8 @@ func (d *qemu) generateQemuConfig(bs *qemuBootState, mountInfo *storagePools.Mou
 	}
 
 	// virtio-sound-pci devices can't be migrated and don't have a CCW equivalent.
-	if virtioSound && !isWindows && !d.CanLiveMigrate() && d.architecture != osarch.ARCH_64BIT_S390_BIG_ENDIAN {
+	// NOTE: We can't use CanLiveMigrate during instance startup as the boot state hasn't yet been recorded.
+	if virtioSound && !isWindows && util.IsFalseOrEmpty(d.expandedConfig["migration.stateful"]) && d.architecture != osarch.ARCH_64BIT_S390_BIG_ENDIAN {
 		devBus, devAddr, multi = bus.allocate(busFunctionGroupGeneric)
 		audioOpts := qemuAudioOpts{
 			dev: qemuDevOpts{
@@ -4235,18 +4253,8 @@ func (d *qemu) writeQemuConfigFile(configPath string) error {
 
 // getCPUOpts retrieves configuration options for virtualized CPUs and memory.
 func (d *qemu) getCPUOpts(cpuInfo *qemuCPUTopology, memSizeBytes int64) (*qemuCPUOpts, error) {
-	// Figure out what memory object layout we're going to use.
-	// Before v6.0 or if version unknown, we use the "repeated" format, otherwise we use "indexed" format.
-	qemuMemObjectFormat := "repeated"
-	qemuVer6, _ := version.NewDottedVersion("6.0")
-	qemuVer, _ := d.version()
-	if qemuVer != nil && qemuVer.Compare(qemuVer6) >= 0 {
-		qemuMemObjectFormat = "indexed"
-	}
-
 	cpuOpts := qemuCPUOpts{
-		architecture:        d.architectureName,
-		qemuMemObjectFormat: qemuMemObjectFormat,
+		architecture: d.architectureName,
 	}
 
 	hostNodes := []uint64{}
@@ -4577,13 +4585,10 @@ func (d *qemu) addDriveConfig(qemuDev map[string]any, bootIndexes map[string]int
 	media := "disk"
 	isRBDImage := strings.HasPrefix(driveConf.DevPath, device.RBDFormatPrefix)
 
-	// Check supported features.
-	// Use io_uring over native for added performance (if supported by QEMU and kernel is recent enough).
-	// We've seen issues starting VMs when running with io_ring AIO mode on kernels before 5.13.
+	// Use io_uring over native for added performance when supported by QEMU.
 	info := DriverStatuses()[instancetype.VM].Info
-	minVer, _ := version.NewDottedVersion("5.13.0")
 	_, ioUring := info.Features["io_uring"]
-	if slices.Contains(driveConf.Opts, device.DiskIOUring) && ioUring && d.state.OS.KernelVersion.Compare(minVer) >= 0 {
+	if slices.Contains(driveConf.Opts, device.DiskIOUring) && ioUring {
 		aioMode = "io_uring"
 	}
 
@@ -5827,6 +5832,19 @@ func (d *qemu) Restore(source instance.Instance, stateful bool, diskOnly bool) e
 
 	var ctxMap logger.Ctx
 
+	// Load the storage driver.
+	pool, err := storagePools.LoadByInstance(d.state, d)
+	if err != nil {
+		op.Done(err)
+		return err
+	}
+
+	err = pool.CanRestoreInstanceSnapshot(d, source)
+	if err != nil {
+		op.Done(err)
+		return err
+	}
+
 	// Stop the instance.
 	wasRunning := false
 	if d.IsRunning() {
@@ -5884,13 +5902,6 @@ func (d *qemu) Restore(source instance.Instance, stateful bool, diskOnly bool) e
 	}
 
 	d.logger.Info("Restoring instance", ctxMap)
-
-	// Load the storage driver.
-	pool, err := storagePools.LoadByInstance(d.state, d)
-	if err != nil {
-		op.Done(err)
-		return err
-	}
 
 	// Restore the rootfs.
 	err = pool.RestoreInstanceSnapshot(d, source, nil)
@@ -7633,7 +7644,7 @@ func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
 	// Receive response from target.
 	d.logger.Debug("Waiting for migration offer response from target")
 	respHeader := &migration.MigrationHeader{}
-	err = args.ControlReceive(respHeader)
+	err = args.ControlReceive(respHeader, true)
 	if err != nil {
 		err := fmt.Errorf("Failed receiving migration offer response: %w", err)
 		op.Done(err)
@@ -7714,7 +7725,7 @@ func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
 		// This will read the result message from the target side and detect disconnections.
 		go func() {
 			resp := migration.MigrationControl{}
-			err := args.ControlReceive(&resp)
+			err := args.ControlReceive(&resp, false)
 			if err != nil {
 				err = fmt.Errorf("Error reading migration control target: %w", err)
 			} else if !resp.GetSuccess() {
@@ -8025,6 +8036,11 @@ func (d *qemu) sendMigrationSnapshot(diskName string, filesystemConn io.ReadWrit
 			return fmt.Errorf("Failed merging migration storage snapshot: %w", err)
 		}
 
+		err = monitor.RemoveBlockDevice(snapshotDiskName)
+		if err != nil {
+			return fmt.Errorf("Failed removing temporary snapshot disk device: %w", err)
+		}
+
 		return nil
 	}
 
@@ -8074,6 +8090,7 @@ func (d *qemu) migrateSendLive(ctx context.Context, pool storagePools.Pool, clus
 	}
 
 	dependentVolumeMove := clusterMoveSourceName != "" && disksToMigrate
+	devicesMap := storagePools.DevicesMapFromBackupConfig(volSourceArgs.Info.Config)
 
 	reverter := revert.New()
 
@@ -8128,7 +8145,12 @@ func (d *qemu) migrateSendLive(ctx context.Context, pool storagePools.Pool, clus
 				continue
 			}
 
-			diskName := d.blockNodeName(linux.PathNameEncode(vol.Name))
+			deviceName := storagePools.DeviceByPoolAndVolume(devicesMap, vol.Pool, vol.Name)
+			if deviceName == "" {
+				return fmt.Errorf("%s/%s does not exists in source device", vol.Pool, vol.Name)
+			}
+
+			diskName := d.blockNodeName(linux.PathNameEncode(deviceName))
 
 			d.logger.Debug("Create snapshot for dependent volume", logger.Ctx{"name": vol.Name, "size": vol.VolumeSize, "diskName": diskName})
 
@@ -8183,7 +8205,7 @@ func (d *qemu) migrateSendLive(ctx context.Context, pool storagePools.Pool, clus
 
 	// Notify the shared disks that they're going to be accessed from another system,
 	// but only when performing a move within the same storage pool.
-	if storagePool == "" {
+	if storagePool == "" && clusterMoveSourceName != "" {
 		for _, dev := range d.expandedDevices.Sorted() {
 			if dev.Config["type"] != "disk" || dev.Config["path"] == "/" || dev.Config["pool"] == "" {
 				continue
@@ -8309,7 +8331,12 @@ func (d *qemu) migrateSendLive(ctx context.Context, pool storagePools.Pool, clus
 				continue
 			}
 
-			diskName := d.blockNodeName(linux.PathNameEncode(vol.Name))
+			deviceName := storagePools.DeviceByPoolAndVolume(devicesMap, vol.Pool, vol.Name)
+			if deviceName == "" {
+				return fmt.Errorf("%s/%s does not exists in source device", vol.Pool, vol.Name)
+			}
+
+			diskName := d.blockNodeName(linux.PathNameEncode(deviceName))
 
 			_, err = d.sendMigrationSnapshot(diskName, filesystemConn, true)
 			if err != nil {
@@ -8374,7 +8401,7 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 	// Receive offer from source.
 	d.logger.Debug("Waiting for migration offer from source")
 	offerHeader := &migration.MigrationHeader{}
-	err = args.ControlReceive(offerHeader)
+	err = args.ControlReceive(offerHeader, true)
 	if err != nil {
 		return fmt.Errorf("Failed receiving migration offer from source: %w", err)
 	}
@@ -8546,7 +8573,7 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 		// This will read the result message from the source side and detect disconnections.
 		go func() {
 			resp := migration.MigrationControl{}
-			err := args.ControlReceive(&resp)
+			err := args.ControlReceive(&resp, false)
 			if err != nil {
 				err = fmt.Errorf("Error reading migration control source: %w", err)
 			} else if !resp.GetSuccess() {
@@ -8716,7 +8743,7 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 
 		// Notify the shared disks that they're going to be accessed from another system,
 		// but only when performing a move within the same storage pool.
-		if !storageMove {
+		if !storageMove && args.ClusterMoveSourceName != "" {
 			for _, dev := range d.expandedDevices.Sorted() {
 				if dev.Config["type"] != "disk" || dev.Config["path"] == "/" || dev.Config["pool"] == "" {
 					continue
@@ -9263,8 +9290,8 @@ func (d *qemu) renderState(statusCode api.StatusCode) (*api.InstanceState, error
 		StatusCode: statusCode,
 	}
 
-	// If VM is stopped, we're done here.
-	if !d.isRunningStatusCode(statusCode) {
+	// If VM is stopped or errored, we're done here.
+	if d.isErrorStatusCode(statusCode) || !d.isRunningStatusCode(statusCode) {
 		return status, nil
 	}
 
@@ -9405,7 +9432,10 @@ func (d *qemu) agentGetState() (*api.InstanceState, error) {
 		return nil, err
 	}
 
-	agent, err := incus.ConnectIncusHTTP(nil, client)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	agent, err := incus.ConnectIncusHTTPWithContext(ctx, nil, client)
 	if err != nil {
 		return nil, fmt.Errorf("Failed connecting to agent: %w", err)
 	}
@@ -9852,7 +9882,10 @@ func (d *qemu) devIncusEventSend(eventType string, eventMessage map[string]any) 
 		SkipGetServer: true,
 	}
 
-	agent, err := incus.ConnectIncusHTTP(agentArgs, client)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	agent, err := incus.ConnectIncusHTTPWithContext(ctx, agentArgs, client)
 	if err != nil {
 		d.logger.Error("Failed to connect to the agent", logger.Ctx{"err": err})
 		return errors.New("Failed to connect to the agent")
@@ -10231,7 +10264,10 @@ func (d *qemu) getAgentMetrics() (*metrics.MetricSet, error) {
 		SkipGetServer: true,
 	}
 
-	agent, err := incus.ConnectIncusHTTP(agentArgs, client)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	agent, err := incus.ConnectIncusHTTPWithContext(ctx, agentArgs, client)
 	if err != nil {
 		d.logger.Error("Failed to connect to the agent", logger.Ctx{"project": d.Project().Name, "instance": d.Name(), "err": err})
 		return nil, errors.New("Failed to connect to the agent")
@@ -10769,11 +10805,25 @@ func (d *qemu) CanLiveMigrate() bool {
 // GuestOS returns the guest OS. In this driver, we consider anything unknown to be Linux.
 func (d *qemu) GuestOS() string {
 	imageOS := strings.ToLower(d.expandedConfig["image.os"])
-	if strings.Contains(imageOS, "windows") {
+	matches := func(names ...string) bool {
+		for _, name := range names {
+			if strings.Contains(imageOS, name) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	if matches("windows") {
 		return "windows"
-	} else if strings.Contains(imageOS, "darwin") || strings.Contains(imageOS, "macos") || strings.Contains(imageOS, "mac os") {
+	}
+
+	if matches("darwin", "macos", "mac os") {
 		return "macos"
-	} else if strings.Contains(imageOS, "freebsd") {
+	}
+
+	if matches("freebsd", "opnsense", "pfsense") {
 		return "freebsd"
 	}
 
