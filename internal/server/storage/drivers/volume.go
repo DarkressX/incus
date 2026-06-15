@@ -672,8 +672,8 @@ func (v Volume) ConfigSizeFromSource(srcVol Volume) (string, error) {
 		return "", err
 	}
 
-	// If volume/pool size is specified (excluding default size), then check it against the image minimum size.
-	volSize := v.ExpandedConfig("size")
+	// If volume size is explicitly specified (not inherited from pool), then check it against the image minimum size.
+	volSize := v.config["size"]
 	if volSize != "" && volSize != "0" {
 		volSizeBytes, err := units.ParseByteSizeString(volSize)
 		if err != nil {
