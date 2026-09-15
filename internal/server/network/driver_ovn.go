@@ -1759,6 +1759,33 @@ func (n *ovn) uplinkAllAllocatedIPs(ctx context.Context, tx *db.ClusterTx, uplin
 		}
 	}
 
+	// Collect the listen address of every network forward and load balancer on the networks
+	// connected to the uplink. These addresses are advertised as VIPs on the uplink, so they must
+	// be treated as allocated when picking an external address for a new OVN network. Without this
+	// a new OVN network could collide with an existing forward/load balancer VIP when it allocates
+	// its own external uplink address (as the VIPs would otherwise not be considered used).
+	externalSubnetsInUse, err := n.common.getExternalSubnetInUse(ctx, tx, uplinkNetName, false)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Failed to get external subnets in use: %w", err)
+	}
+
+	for _, externalSubnet := range externalSubnetsInUse {
+		if externalSubnet.usageType != subnetUsageNetworkForward && externalSubnet.usageType != subnetUsageNetworkLoadBalancer {
+			continue
+		}
+
+		ipAddress := externalSubnet.subnet.IP
+		if ipAddress == nil || ipAddress.IsUnspecified() {
+			continue
+		}
+
+		if ipAddress.To4() != nil {
+			v4IPs = append(v4IPs, ipAddress)
+		} else {
+			v6IPs = append(v6IPs, ipAddress)
+		}
+	}
+
 	return v4IPs, v6IPs, nil
 }
 
