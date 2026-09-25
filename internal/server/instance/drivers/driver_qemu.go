@@ -6738,6 +6738,23 @@ func (d *qemu) snapshot(name string, expiry time.Time, stateful bool) error {
 	var err error
 	var monitor *qmp.Monitor
 
+	// Freeze the guest filesystems through the agent to ensure a consistent snapshot. This is
+	// best-effort: VMs without a running agent simply skip the freeze. The filesystems are always
+	// thawed once the snapshot is done, even if it failed.
+	if d.IsRunning() {
+		err = d.agentFreezeFilesystems()
+		if err != nil && !errors.Is(err, errQemuAgentOffline) && !api.StatusErrorCheck(err, http.StatusNotFound) {
+			d.logger.Warn("Failed freezing filesystems through the agent, snapshot may be inconsistent", logger.Ctx{"err": err})
+		}
+
+		defer func() {
+			thawErr := d.agentUnfreezeFilesystems()
+			if thawErr != nil && !errors.Is(thawErr, errQemuAgentOffline) && !api.StatusErrorCheck(thawErr, http.StatusNotFound) {
+				d.logger.Warn("Failed to thaw filesystems after snapshot", logger.Ctx{"err": thawErr})
+			}
+		}()
+	}
+
 	// Deal with state.
 	if stateful {
 		// Confirm the instance has stateful migration enabled.
@@ -10801,6 +10818,56 @@ func (d *qemu) agentGetState() (*api.InstanceState, error) {
 	}
 
 	return status, nil
+}
+
+// agentFreezeFilesystems freezes the guest filesystems through the agent.
+func (d *qemu) agentFreezeFilesystems() error {
+	client, err := d.getAgentClient()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	agent, err := incus.ConnectIncusHTTPWithContext(ctx, nil, client)
+	if err != nil {
+		return fmt.Errorf("Failed connecting to agent: %w", err)
+	}
+
+	defer agent.Disconnect()
+
+	_, _, err = agent.RawQuery("POST", "/1.0/freeze", nil, "")
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// agentUnfreezeFilesystems thaws the guest filesystems through the agent.
+func (d *qemu) agentUnfreezeFilesystems() error {
+	client, err := d.getAgentClient()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	agent, err := incus.ConnectIncusHTTPWithContext(ctx, nil, client)
+	if err != nil {
+		return fmt.Errorf("Failed connecting to agent: %w", err)
+	}
+
+	defer agent.Disconnect()
+
+	_, _, err = agent.RawQuery("POST", "/1.0/unfreeze", nil, "")
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // IsRunning returns whether or not the instance is running.
