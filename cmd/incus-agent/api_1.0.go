@@ -28,6 +28,7 @@ var api10 = []APIEndpoint{
 	api10Cmd,
 	execCmd,
 	eventsCmd,
+	freezeCmd,
 	metricsCmd,
 	operationsCmd,
 	operationCmd,
@@ -36,6 +37,7 @@ var api10 = []APIEndpoint{
 	portForwardCmd,
 	sftpCmd,
 	stateCmd,
+	unfreezeCmd,
 }
 
 func api10Get(d *Daemon, r *http.Request) response.Response {
